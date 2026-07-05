@@ -20,7 +20,7 @@ def initialize(context):
     g.short_window = 5
     g.long_window = 10
     g.adx_period = 14
-    g.adx_threshold = 10
+    g.adx_threshold = 30
     g.in_position = False
 
     set_benchmark('000300.XSHG')    # 基准收益 = 沪深300

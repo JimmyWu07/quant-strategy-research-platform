@@ -24,6 +24,8 @@ build/
 *.h5
 *.parquet
 research/data/
+Quant Research Platform v2/output/
+Quant Research Platform v2/data_cache/
 
 # OS
 .DS_Store

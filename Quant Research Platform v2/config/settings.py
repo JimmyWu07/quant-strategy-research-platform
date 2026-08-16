@@ -13,7 +13,7 @@ from pathlib import Path
 # ============================================================
 # 路径
 # ============================================================
-PROJECT_ROOT = Path(__file__).parent
+PROJECT_ROOT = Path(__file__).parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
 DATA_CACHE_DIR = PROJECT_ROOT / "data_cache"
 
@@ -137,12 +137,36 @@ MAX_WEIGHT_PER_STOCK = 0.05      # 单票最大权重 5%
 MAX_INDUSTRY_WEIGHT = 0.20       # 单行业最大权重 20%
 
 # ============================================================
+# 回测交易成本
+# ============================================================
+COMMISSION_RATE = 0.00025       # 佣金费率(万2.5,买卖双边)
+STAMP_DUTY_RATE = 0.0005        # 印花税(卖出单边0.05%)
+SLIPPAGE_RATE = 0.001           # 滑点(0.1%)
+# 单次调仓综合成本(买入+卖出): 佣金×2 + 印花税 + 滑点×2
+TURNOVER_COST_RATE = COMMISSION_RATE * 2 + STAMP_DUTY_RATE + SLIPPAGE_RATE * 2
+
+# 基准
+BENCHMARK_SYMBOL = "sh000300"   # 沪深300(新浪/腾讯格式)
+BENCHMARK_NAME = "沪深300"
+
+# ============================================================
 # 行业分类
 # ============================================================
 # 使用申万二级行业(如: 半导体, 航天装备, 自动化设备)
 # 数据来源: akshare stock_board_industry_* 系列接口
 # 若无法获取申万分类,回退到同花顺行业分类
 INDUSTRY_STANDARD = "ths"  # "sw"=申万, "ths"=同花顺
+
+# ============================================================
+# 历史回测
+# ============================================================
+# ref_date 距今日 ≤ HISTORICAL_THRESHOLD_DAYS 天,视为「实时筛选」用腾讯行情
+# 超过此阈值则视为「历史回测」,改用 K 线估算候选池(避免前视)
+HISTORICAL_THRESHOLD_DAYS = 14
+
+# 无风险利率(国债年化收益率) — 现金部分收益
+RISK_FREE_RATE_ANNUAL = 0.025  # 年化 2.5%
+RISK_FREE_RATE_MONTHLY = RISK_FREE_RATE_ANNUAL / 12  # 月化 ≈ 0.208%
 
 # ============================================================
 # API 请求控制

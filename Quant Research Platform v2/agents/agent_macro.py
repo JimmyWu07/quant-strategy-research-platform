@@ -23,7 +23,7 @@ from config import (
     MACRO_WEIGHT_PMI, MACRO_WEIGHT_M2, MACRO_WEIGHT_SOCIAL_FIN,
     MACRO_PCT_LOW, MACRO_PCT_HIGH,
 )
-from utils import get_logger
+from config.utils import get_logger
 
 logger = get_logger("AgentMacro")
 

@@ -16,7 +16,7 @@ from typing import Callable, Optional, Any
 import numpy as np
 import pandas as pd
 
-from config import (
+from config.settings import (
     LOG_LEVEL, LOG_FORMAT, DATA_CACHE_DIR,
     REQUEST_DELAY, REQUEST_RETRIES, REQUEST_TIMEOUT,
 )

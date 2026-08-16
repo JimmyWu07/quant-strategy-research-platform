@@ -28,16 +28,18 @@ import pandas as pd
 from config import (
     BACKTEST_START, BACKTEST_END,
     TOP_N_STOCKS, OUTPUT_DIR,
+    TURNOVER_COST_RATE, BENCHMARK_SYMBOL, BENCHMARK_NAME,
+    RISK_FREE_RATE_MONTHLY,
 )
-from utils import (
+from config.utils import (
     get_logger, save_cache, load_cache,
     generate_rebalance_dates, progress_bar,
 )
-from agent_data import AgentData
-from agent_factor import AgentFactor
-from agent_risk import AgentRisk
-from agent_macro import AgentMacro
-from agent_portfolio import AgentPortfolio
+from agents.agent_data import AgentData
+from agents.agent_factor import AgentFactor
+from agents.agent_risk import AgentRisk
+from agents.agent_macro import AgentMacro
+from agents.agent_portfolio import AgentPortfolio
 
 logger = get_logger("Coordinator")
 
@@ -140,7 +142,7 @@ class Coordinator:
 
         # === Step 3: 财务数据 ===
         logger.info("[Step 3/6] 获取财务数据...")
-        financial_df = self.agent_data.get_financials(symbols, date)
+        financial_df = self.agent_data.get_financials(symbols, date, universe_df=universe)
 
         # === Step 4: PE/PB 历史分位 ===
         logger.info("[Step 4/6] 计算 PE/PB 历史分位...")
@@ -253,6 +255,7 @@ class Coordinator:
 
         results = []
         monthly_returns = {}
+        benchmark_returns = {}
 
         for i, date in enumerate(dates):
             logger.info("\n>>> 调仓 %d/%d: %s", i + 1, len(dates), date)
@@ -264,12 +267,55 @@ class Coordinator:
                 # 计算下月收益(如果有下一期数据)
                 if i < len(dates) - 1:
                     next_date = dates[i + 1]
-                    ret = self._calc_holding_return(
+                    stock_ret = self._calc_holding_return(
                         result.get("top_50", pd.DataFrame()),
                         date, next_date,
                     )
+                    # 宏观仓位: 股票部分 × position_ratio + 现金部分 × 无风险月利率
+                    position_ratio = result.get("macro", {}).get("position_ratio", 1.0)
+                    cash_ratio = max(0.0, 1.0 - position_ratio)
+                    if not np.isnan(stock_ret):
+                        ret = stock_ret * position_ratio + RISK_FREE_RATE_MONTHLY * cash_ratio
+                    else:
+                        ret = np.nan
+
                     monthly_returns[date] = ret
-                    logger.info("持有期 %s → %s 收益: %.2f%%", date, next_date, ret * 100)
+
+                    # 基准收益
+                    bench_ret = self._calc_benchmark_return(date, next_date)
+                    benchmark_returns[date] = bench_ret
+
+                    excess = ret - bench_ret if not np.isnan(bench_ret) else np.nan
+                    logger.info(
+                        "持有期 %s → %s 收益: %.2f%% (股票×%.0f%% + 现金×%.0f%%)"
+                        " | %s: %.2f%% | 超额: %.2f%%",
+                        date, next_date, ret * 100 if not np.isnan(ret) else 0,
+                        position_ratio * 100, cash_ratio * 100,
+                        BENCHMARK_NAME,
+                        bench_ret * 100 if not np.isnan(bench_ret) else 0,
+                        excess * 100 if not np.isnan(excess) else 0
+                    )
+
+                    # 进度汇总
+                    done_count = i + 1
+                    valid_returns = [v for v in monthly_returns.values() if not np.isnan(v)]
+                    cum_ret = 1.0
+                    for v in valid_returns:
+                        cum_ret *= (1 + v)
+                    cum_ret -= 1
+                    avg_ret = sum(valid_returns) / len(valid_returns) if valid_returns else 0
+                    win_count = sum(1 for v in valid_returns if v > 0)
+                    logger.info(
+                        "========== 回测进度: %d/%d 期 (%.0f%%) ==========\n"
+                        "  累计收益: %.2f%% | 月均: %.2f%% | 胜率: %d/%d (%.0f%%)\n"
+                        "  下一期: %s%s",
+                        done_count, len(dates), done_count / len(dates) * 100,
+                        cum_ret * 100, avg_ret * 100,
+                        win_count, len(valid_returns),
+                        win_count / len(valid_returns) * 100 if valid_returns else 0,
+                        dates[i + 1] if i + 1 < len(dates) else "完成",
+                        " (剩余 %d 期)" % (len(dates) - done_count) if done_count < len(dates) else ""
+                    )
 
             except Exception as e:
                 logger.error("调仓 %s 失败: %s", date, e, exc_info=True)
@@ -277,25 +323,39 @@ class Coordinator:
 
         # 汇总回测收益
         returns_series = pd.Series(monthly_returns).sort_index()
+        benchmark_series = pd.Series(benchmark_returns).sort_index()
         cumulative = (1 + returns_series).prod() - 1 if not returns_series.empty else 0
 
-        summary = self._backtest_summary(returns_series, results)
+        summary = self._backtest_summary(returns_series, results, benchmark_series)
 
         logger.info("\n" + "=" * 60)
-        logger.info("回测完成: 累计收益 %.2f%%", cumulative * 100)
-        logger.info("年化收益 %.2f%%", summary.get("annual_return", 0) * 100)
-        logger.info("最大回撤 %.2f%%", summary.get("max_drawdown", 0) * 100)
-        logger.info("夏普比率 %.2f", summary.get("sharpe_ratio", 0))
+        logger.info("回测完成:")
+        logger.info("  策略累计收益: %.2f%%", cumulative * 100)
+        logger.info("  策略年化收益: %.2f%%", summary.get("annual_return", 0) * 100)
+        logger.info("  策略最大回撤: %.2f%%", summary.get("max_drawdown", 0) * 100)
+        logger.info("  策略夏普比率: %.2f", summary.get("sharpe_ratio", 0))
+        if "benchmark_cumulative" in summary:
+            logger.info("  ---")
+            logger.info("  %s累计收益: %.2f%%", BENCHMARK_NAME, summary.get("benchmark_cumulative", 0) * 100)
+            logger.info("  %s年化收益: %.2f%%", BENCHMARK_NAME, summary.get("benchmark_annual", 0) * 100)
+            logger.info("  %s最大回撤: %.2f%%", BENCHMARK_NAME, summary.get("benchmark_max_drawdown", 0) * 100)
+            logger.info("  ---")
+            logger.info("  超额累计收益: %.2f%%", summary.get("excess_cumulative", 0) * 100)
+            logger.info("  超额年化收益: %.2f%%", summary.get("excess_annual", 0) * 100)
+            logger.info("  信息比率: %.2f", summary.get("information_ratio", 0))
+        logger.info("  ---")
+        logger.info("  交易成本(单次): %.4f%%", TURNOVER_COST_RATE * 100)
         logger.info("=" * 60)
 
         # 保存结果
         self._save_backtest_results(
-            returns_series, cumulative, summary, results
+            returns_series, cumulative, summary, results, benchmark_series
         )
 
         return {
             "rebalance_results": results,
             "monthly_returns": returns_series,
+            "benchmark_returns": benchmark_series,
             "cumulative_return": cumulative,
             "summary": summary,
         }
@@ -307,11 +367,9 @@ class Coordinator:
         end_date: str,
     ) -> float:
         """
-        计算等权组合在持有期的收益率.
+        计算等权组合在持有期的收益率(扣除交易成本).
 
-        由于逐月回测中下一期的价格数据在下一次 run_screening 才拉取,
-        这里做简化:用选中的股票期末 vs 期初价格.
-        若数据不可用,返回 NaN.
+        交易成本: 佣金(万2.5×2) + 印花税(0.05%) + 滑点(0.1%×2) ≈ 0.085%
         """
         if selected.empty:
             return 0.0
@@ -331,17 +389,48 @@ class Coordinator:
                         returns.append(r)
 
             if returns:
-                return float(np.mean(returns))
+                gross_return = float(np.mean(returns))
+                # 扣除交易成本(买入+卖出)
+                net_return = gross_return - TURNOVER_COST_RATE
+                return net_return
             return np.nan
         except Exception:
+            return np.nan
+
+    def _calc_benchmark_return(self, start_date: str, end_date: str) -> float:
+        """计算沪深300基准在持有期的收益率(用新浪指数接口)"""
+        try:
+            import akshare as ak
+            # 新浪指数日线: 一次拉全历史,本地按日期过滤
+            cache_name = "benchmark_hs300_daily"
+            cached = load_cache(cache_name) if self.agent_data.use_cache else None
+            if cached is not None:
+                df = cached
+            else:
+                df = ak.stock_zh_index_daily(symbol="sh000300")
+                if df is not None and not df.empty:
+                    save_cache(cache_name, df)
+
+            if df is None or df.empty:
+                return np.nan
+
+            df["date"] = pd.to_datetime(df["date"])
+            mask = (df["date"] >= start_date) & (df["date"] <= end_date)
+            subset = df.loc[mask].sort_values("date")
+            if len(subset) < 2:
+                return np.nan
+            return float(subset["close"].iloc[-1] / subset["close"].iloc[0] - 1)
+        except Exception as e:
+            logger.debug("基准收益计算失败: %s", str(e)[:80])
             return np.nan
 
     def _backtest_summary(
         self,
         returns: pd.Series,
         results: List[dict],
+        benchmark_returns: Optional[pd.Series] = None,
     ) -> dict:
-        """计算回测绩效指标"""
+        """计算回测绩效指标(含基准对比)"""
         valid = returns.dropna()
         if len(valid) < 2:
             return {
@@ -368,7 +457,7 @@ class Coordinator:
 
         win_rate = (valid > 0).mean()
 
-        return {
+        summary = {
             "n_periods": len(valid),
             "cumulative_return": round(float(cumulative), 4),
             "annual_return": round(float(annual_return), 4),
@@ -379,18 +468,59 @@ class Coordinator:
             "error_count": sum(1 for r in results if "error" in r),
         }
 
+        # 基准对比
+        if benchmark_returns is not None and not benchmark_returns.empty:
+            bench_valid = benchmark_returns.reindex(valid.index).dropna()
+            if len(bench_valid) >= 2:
+                bench_cum = (1 + bench_valid).prod() - 1
+                bench_annual = (1 + bench_cum) ** (12 / len(bench_valid)) - 1
+                bench_vol = bench_valid.std() * np.sqrt(12)
+                bench_sharpe = bench_annual / bench_vol if bench_vol > 0 else 0
+
+                # 超额收益
+                excess = valid - bench_valid.reindex(valid.index).fillna(0)
+                excess_cum = (1 + excess).prod() - 1
+                excess_annual = (1 + excess_cum) ** (12 / len(excess)) - 1
+                tracking_error = excess.std() * np.sqrt(12) if excess.std() > 0 else 0
+                info_ratio = excess_annual / tracking_error if tracking_error > 0 else 0
+
+                # 基准最大回撤
+                bench_cum_series = (1 + bench_valid).cumprod()
+                bench_running_max = bench_cum_series.cummax()
+                bench_dd = (bench_cum_series - bench_running_max) / bench_running_max
+                bench_max_dd = float(bench_dd.min())
+
+                summary.update({
+                    "benchmark_name": BENCHMARK_NAME,
+                    "benchmark_cumulative": round(float(bench_cum), 4),
+                    "benchmark_annual": round(float(bench_annual), 4),
+                    "benchmark_volatility": round(float(bench_vol), 4),
+                    "benchmark_sharpe": round(float(bench_sharpe), 2),
+                    "benchmark_max_drawdown": round(float(bench_max_dd), 4),
+                    "excess_cumulative": round(float(excess_cum), 4),
+                    "excess_annual": round(float(excess_annual), 4),
+                    "tracking_error": round(float(tracking_error), 4),
+                    "information_ratio": round(float(info_ratio), 2),
+                })
+
+        return summary
+
     def _save_backtest_results(
         self,
         returns: pd.Series,
         cumulative: float,
         summary: dict,
         results: List[dict],
+        benchmark_returns: Optional[pd.Series] = None,
     ) -> None:
         """保存回测结果到 output 目录"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # 保存收益序列
+        # 保存收益序列(策略+基准)
         returns.to_csv(OUTPUT_DIR / f"monthly_returns_{timestamp}.csv", header=["return"])
+        if benchmark_returns is not None and not benchmark_returns.empty:
+            combined = pd.DataFrame({"strategy": returns, "benchmark": benchmark_returns})
+            combined.to_csv(OUTPUT_DIR / f"returns_vs_benchmark_{timestamp}.csv")
 
         # 保存摘要
         with open(OUTPUT_DIR / f"backtest_summary_{timestamp}.json", "w", encoding="utf-8") as f:

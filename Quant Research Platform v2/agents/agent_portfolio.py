@@ -20,7 +20,7 @@ import pandas as pd
 from config import (
     TOP_N_STOCKS, MAX_WEIGHT_PER_STOCK, MAX_INDUSTRY_WEIGHT,
 )
-from utils import get_logger
+from config.utils import get_logger
 
 logger = get_logger("AgentPortfolio")
 

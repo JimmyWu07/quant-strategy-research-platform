@@ -27,7 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 def cmd_screen():
     """当前选股"""
-    from coordinator import Coordinator
+    from agents.coordinator import Coordinator
 
     print("\n" + "█" * 60)
     print("  多因子选股系统 v2 — 当前筛选")
@@ -51,7 +51,7 @@ def cmd_screen():
 
 def cmd_backtest():
     """逐月回测"""
-    from coordinator import Coordinator
+    from agents.coordinator import Coordinator
     from config import BACKTEST_START, BACKTEST_END
 
     print("\n" + "█" * 60)
@@ -80,13 +80,15 @@ def cmd_check():
 
     modules = [
         "config",
-        "utils",
-        "agent_data",
-        "agent_factor",
-        "agent_risk",
-        "agent_macro",
-        "agent_portfolio",
-        "coordinator",
+        "config.settings",
+        "config.utils",
+        "agents",
+        "agents.agent_data",
+        "agents.agent_factor",
+        "agents.agent_risk",
+        "agents.agent_macro",
+        "agents.agent_portfolio",
+        "agents.coordinator",
     ]
 
     print("\n模块检查:")

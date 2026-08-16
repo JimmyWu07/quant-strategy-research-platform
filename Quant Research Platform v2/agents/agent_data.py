@@ -23,10 +23,10 @@ import requests
 from config import (
     MIN_LISTING_DAYS, MIN_AVG_TURNOVER,
     EXCLUDE_ST, EXCLUDE_BEIJING, PRE_FILTER_TOP_N,
-    FINANCIAL_LAG_MONTHS,
+    FINANCIAL_LAG_MONTHS, HISTORICAL_THRESHOLD_DAYS,
     INDUSTRY_STANDARD, DATA_CACHE_DIR,
 )
-from utils import (
+from config.utils import (
     get_logger, retry_on_error, save_cache, load_cache,
     clean_symbol, is_st_stock, is_beijing_stock,
     progress_bar,
@@ -91,6 +91,10 @@ class AgentData:
     def get_stock_universe(self, date: Optional[str] = None) -> pd.DataFrame:
         """
         获取经硬门槛过滤后的候选股票池.
+
+        数据模式:
+          - 实时筛选 (ref_date 距今日 ≤ HISTORICAL_THRESHOLD_DAYS 天): 使用腾讯行情,数据完整(PE/PB/成交额/市值)
+          - 历史回测 (超过阈值): 避免前视偏差,用 K 线数据近似过滤(上市天数 + 20日日均成交额)
         """
         cache_name = f"{CACHE_UNIVERSE}_{date}" if date else CACHE_UNIVERSE
         cached = load_cache(cache_name) if self.use_cache else None
@@ -98,34 +102,185 @@ class AgentData:
             logger.info("命中缓存: %s,共 %d 只股票", cache_name, len(cached))
             return cached
 
-        logger.info("正在获取 A 股全市场数据...")
+        today = pd.Timestamp.today().normalize()
+        ref_ts = pd.Timestamp(date) if date else today
+        days_diff = (today - ref_ts).days
+        is_historical = (date is not None) and (days_diff > HISTORICAL_THRESHOLD_DAYS)
 
-        # 1a. 获取股票列表
-        stock_list = self._get_stock_list()
+        if is_historical:
+            logger.info("[历史回测模式] ref=%s (距今日 %d 天),改用 K 线估算候选池", date, days_diff)
+            df = self._get_stock_universe_historical(stock_list=self._get_stock_list(), ref_date=date)
+        else:
+            logger.info("[实时筛选模式] ref=%s (距今日 %d 天),使用腾讯行情", date, days_diff)
+            df = self._get_stock_universe_realtime(stock_list=self._get_stock_list())
+
+        # 只缓存非空结果,避免空缓存阻断后续重试
+        if df is not None and not df.empty:
+            save_cache(cache_name, df)
+        return df
+
+    def _get_stock_universe_realtime(self, stock_list: pd.DataFrame) -> pd.DataFrame:
+        """实时筛选模式: 腾讯行情获取 PE/PB/市值/成交额 等完整数据"""
         all_symbols = stock_list["symbol"].tolist()
         logger.info("全市场: %d 只股票", len(all_symbols))
 
-        # 1b. 批量获取腾讯行情数据(PE/PB/市值/成交额/价格)
         quotes = self._fetch_tencent_quotes_batch(all_symbols)
         if quotes.empty:
             logger.error("腾讯行情数据获取失败")
             return pd.DataFrame()
 
-        # 1c. 合并名称(quotes已有name,stock_list的name作为补充)
         name_lookup = stock_list.set_index("symbol")["name"]
         if "name" in quotes.columns:
             quotes["name"] = quotes["name"].fillna(quotes["symbol"].map(name_lookup))
         else:
             quotes["name"] = quotes["symbol"].map(name_lookup)
 
-        # 1d. 硬门槛过滤
-        df = self._apply_hard_filters(quotes)
+        df = self._apply_hard_filters(quotes, mode="realtime")
         logger.info("股票池过滤完成: 全市场 %d → 候选池 %d 只", len(quotes), len(df))
-        save_cache(cache_name, df)
         return df
 
-    def _apply_hard_filters(self, df: pd.DataFrame) -> pd.DataFrame:
-        """应用硬门槛过滤"""
+    def _get_stock_universe_historical(self, stock_list: pd.DataFrame, ref_date: str) -> pd.DataFrame:
+        """
+        历史回测模式: 先用腾讯批量行情初筛,再对 Top N 拉 K 线验证上市天数.
+
+        策略: 用当前行情数据做粗筛(成交额/PE/PB),只对最终 Top N 拉历史K线检查上市天数.
+        这样 K 线拉取从 ~5000 只降到 ~300 只.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        all_symbols = stock_list["symbol"].tolist()
+        logger.info("全市场: %d 只股票", len(all_symbols))
+
+        # Step1: 腾讯批量行情初筛 (一次API拿全市场)
+        quotes = self._fetch_tencent_quotes_batch(all_symbols)
+        if quotes.empty:
+            logger.error("腾讯行情数据获取失败")
+            return pd.DataFrame()
+
+        name_lookup = stock_list.set_index("symbol")["name"]
+        if "name" in quotes.columns:
+            quotes["name"] = quotes["name"].fillna(quotes["symbol"].map(name_lookup))
+        else:
+            quotes["name"] = quotes["symbol"].map(name_lookup)
+
+        # Step2: 硬门槛过滤 (ST/北交所/PE/PB/成交额/Top N)
+        df = self._apply_hard_filters(quotes, mode="realtime")
+        logger.info("腾讯行情初筛: %d → %d 只", len(quotes), len(df))
+
+        if df.empty:
+            return df
+
+        # Step3: 只对 Top N 拉历史K线, 验证上市天数
+        symbols = df["symbol"].tolist()
+        logger.info("拉取 %d 只 Top 候选的 K线 (验证上市天数)...", len(symbols))
+
+        lookback_start = (pd.Timestamp(ref_date) - pd.DateOffset(days=450)).strftime("%Y-%m-%d")
+        listing_map = {}
+        MAX_WORKERS = min(10, len(symbols))
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_map = {
+                executor.submit(self._fetch_full_kline_with_amount,
+                                sym, lookback_start, ref_date): sym
+                for sym in symbols
+            }
+            for future in as_completed(future_map):
+                sym = future_map[future]
+                completed += 1
+                if completed % 50 == 0:
+                    logger.info(progress_bar(completed, len(symbols), "上市天数验证"))
+                try:
+                    info = future.result()
+                    if info is not None:
+                        listing_map[sym] = info
+                except Exception:
+                    continue
+
+        # Step4: 上市天数过滤
+        if MIN_LISTING_DAYS and MIN_LISTING_DAYS > 0:
+            before = len(df)
+            valid_syms = [s for s, info in listing_map.items()
+                          if info["listing_days"] >= MIN_LISTING_DAYS]
+            df = df[df["symbol"].isin(valid_syms)]
+            logger.info("上市天数过滤: %d → %d 只 (门槛 %d天, K线有效 %d 只)",
+                        before, len(df), MIN_LISTING_DAYS, len(listing_map))
+
+        # Step5: 用历史20日均成交额替换当日成交额 (更准确)
+        for idx, row in df.iterrows():
+            sym = row["symbol"]
+            if sym in listing_map and not np.isnan(listing_map[sym]["avg_turnover_20d"]):
+                df.at[idx, "turnover"] = listing_map[sym]["avg_turnover_20d"]
+
+        logger.warning(
+            "[历史回测模式] PE/PB/成交额来自腾讯当前行情(非ref_date当日),"
+            "但财务+宏观数据已做前视偏差修复,因子排名用截面相对值,影响可控。"
+        )
+        logger.info("(历史回测) 候选池过滤完成: 候选池 %d 只", len(df))
+        return df.reset_index(drop=True)
+
+    def _fetch_full_kline_with_amount(
+        self, symbol: str, start: str, end: str
+    ) -> Optional[dict]:
+        """
+        获取单只股票完整历史K线(含成交额列).
+        返回 dict: {symbol, listing_days, avg_turnover_20d, close_on_ref}
+        """
+        hist = self._fetch_single_stock_history_full(symbol, start, end)
+        if hist is None or hist.empty:
+            return None
+
+        listing_days = len(hist)
+        # 近 20 日日均成交额
+        if "volume" in hist.columns and "close" in hist.columns:
+            # 新浪 ak.stock_zh_a_daily 的列: date, open, high, low, close, volume, outstanding_share, turnover
+            # 成交额 ≈ 成交量 * 收盘价 近似
+            turnover_series = hist["volume"] * hist["close"]
+            if "turnover" in hist.columns:
+                # 如果有真实 turnover 列优先使用
+                turnover_series = pd.to_numeric(hist["turnover"], errors="coerce").fillna(turnover_series)
+            avg_turnover_20d = float(turnover_series.tail(20).mean()) if len(turnover_series) >= 20 else float(turnover_series.mean())
+        else:
+            avg_turnover_20d = np.nan
+
+        close_on_ref = float(hist["close"].iloc[-1]) if not hist.empty else np.nan
+
+        return {
+            "symbol": symbol,
+            "listing_days": listing_days,
+            "avg_turnover_20d": avg_turnover_20d,
+            "close_on_ref": close_on_ref,
+        }
+
+    @retry_on_error(max_retries=1, delay=0.3)
+    def _fetch_single_stock_history_full(
+        self, symbol: str, start: str, end: str
+    ) -> Optional[pd.DataFrame]:
+        """拉取完整K线(含成交量列), 供历史回测模式做候选池估算"""
+        import akshare as ak
+        code = symbol.replace(".XSHG", "").replace(".XSHE", "")
+        sina_code = f"sh{code}" if symbol.endswith(".XSHG") or code.startswith(("60", "68")) else f"sz{code}"
+
+        try:
+            raw = ak.stock_zh_a_daily(symbol=sina_code, adjust="qfq")
+        except Exception:
+            return None
+
+        if raw is None or raw.empty:
+            return None
+        raw["date"] = pd.to_datetime(raw["date"])
+        raw = raw.set_index("date").sort_index()
+        mask = (raw.index >= start) & (raw.index <= end)
+        return raw.loc[mask] if mask.any() else None
+
+    def _apply_hard_filters(self, df: pd.DataFrame, mode: str = "realtime") -> pd.DataFrame:
+        """
+        应用硬门槛过滤.
+
+        参数 mode:
+          - "realtime": 腾讯行情数据,有 PE/PB/成交额(当日)
+          - "historical": 已在 _get_stock_universe_historical 内联实现
+        """
         initial = len(df)
 
         # 1. 排除 ST
@@ -258,12 +413,12 @@ class AgentData:
         end_date: str,
     ) -> pd.DataFrame:
         """
-        批量获取股票历史日线数据(带线程超时保护).
+        批量获取股票历史日线数据(多线程并行).
 
         返回:
             DataFrame, index=日期, columns=股票代码, values=收盘价
         """
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         cache_name = f"{CACHE_PRICES}_{start_date}_{end_date}"
         cached = load_cache(cache_name) if self.use_cache else None
@@ -273,31 +428,32 @@ class AgentData:
 
         logger.info("获取 %d 只股票历史K线 (%s → %s)...", len(symbols), start_date, end_date)
 
+        MAX_WORKERS = min(10, len(symbols))
         price_dict = {}
         failed = 0
-        PER_STOCK_TIMEOUT = 15  # 单只15秒超时
+        completed = 0
 
-        for i, sym in enumerate(symbols):
-            if i % 50 == 0:
-                logger.info(progress_bar(i, len(symbols), "拉取K线"))
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_sym = {
+                executor.submit(self._fetch_single_stock_history, sym, start_date, end_date): sym
+                for sym in symbols
+            }
 
-            try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self._fetch_single_stock_history, sym, start_date, end_date)
-                    try:
-                        hist = future.result(timeout=PER_STOCK_TIMEOUT)
-                    except FuturesTimeout:
-                        logger.warning("%s K线超时 (>%ds), 跳过", sym, PER_STOCK_TIMEOUT)
+            for future in as_completed(future_to_sym):
+                sym = future_to_sym[future]
+                completed += 1
+                if completed % 50 == 0:
+                    logger.info(progress_bar(completed, len(symbols), "拉取K线"))
+
+                try:
+                    hist = future.result()
+                    if hist is not None and not hist.empty:
+                        price_dict[sym] = hist["close"]
+                    else:
                         failed += 1
-                        continue
-
-                if hist is not None and not hist.empty:
-                    price_dict[sym] = hist["close"]
-                else:
+                except Exception as e:
+                    logger.debug("%s K线失败: %s", sym, str(e)[:80])
                     failed += 1
-            except Exception as e:
-                logger.debug("%s K线失败: %s", sym, str(e)[:80])
-                failed += 1
 
         logger.info("K线获取完成: 成功 %d, 失败 %d", len(price_dict), failed)
 
@@ -342,12 +498,18 @@ class AgentData:
         self,
         symbols: List[str],
         ref_date: str,
+        universe_df: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
         """
-        获取财务指标(ROE,毛利率,经营现金流,净利润增速).
+        获取财务指标(ROE,毛利率,经营现金流,净利润增速,PEG).
+
+        参数:
+            symbols: 股票代码列表
+            ref_date: 参考日期(用于防前视偏差,只取该日期前可用的财报)
+            universe_df: 股票池(含PE列,用于计算PEG)
 
         返回:
-            DataFrame, index=股票代码, columns=[roe, gross_margin, cfo_to_np, np_yoy]
+            DataFrame, index=股票代码, columns=[roe, gross_margin, cfo_to_np, np_yoy, peg]
         """
         cache_name = f"{CACHE_FINANCIALS}_{ref_date}"
         cached = load_cache(cache_name) if self.use_cache else None
@@ -357,21 +519,37 @@ class AgentData:
 
         logger.info("获取 %d 只股票财务数据 (ref=%s)...", len(symbols), ref_date)
 
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         results = {}
         failed = 0
+        completed = 0
+        MAX_WORKERS = min(5, len(symbols))
+        TIMEOUT_PER_STOCK = 15  # 秒
 
-        for i, sym in enumerate(symbols):
-            if i % 200 == 0:
-                logger.info(progress_bar(i, len(symbols), "拉取财务"))
-
-            try:
-                fin = self._fetch_single_financial(sym)
-                if fin:
-                    results[sym] = fin
-                else:
+        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        future_map = {
+            executor.submit(self._fetch_single_financial, sym, ref_date): sym
+            for sym in symbols
+        }
+        try:
+            for future in as_completed(future_map, timeout=len(symbols) * TIMEOUT_PER_STOCK):
+                sym = future_map[future]
+                completed += 1
+                if completed % 50 == 0:
+                    logger.info(progress_bar(completed, len(symbols), "拉取财务"))
+                try:
+                    fin = future.result(timeout=TIMEOUT_PER_STOCK)
+                    if fin:
+                        results[sym] = fin
+                    else:
+                        failed += 1
+                except Exception:
                     failed += 1
-            except Exception:
-                failed += 1
+        except Exception:
+            logger.warning("财务数据拉取超时,已完成 %d/%d", completed, len(symbols))
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         logger.info("财务数据获取完成: 成功 %d, 失败 %d", len(results), failed)
 
@@ -380,12 +558,63 @@ class AgentData:
 
         df = pd.DataFrame(results).T
         df.index.name = "symbol"
+
+        # 计算 PEG = PE / 净利润增速(%)
+        if universe_df is not None and "np_yoy" in df.columns:
+            if "symbol" in universe_df.columns:
+                pe_lookup = universe_df.set_index("symbol")["pe"]
+            else:
+                pe_lookup = universe_df["pe"]
+            pe_aligned = pe_lookup.reindex(df.index)
+            np_yoy_aligned = df["np_yoy"]
+            # PEG 仅在 PE>0 且 np_yoy>0 时有效
+            mask = (pe_aligned > 0) & (np_yoy_aligned > 0)
+            df["peg"] = np.nan
+            df.loc[mask, "peg"] = pe_aligned[mask] / np_yoy_aligned[mask]
+            logger.info("PEG 计算: %d/%d 有效", mask.sum(), len(df))
+
         save_cache(cache_name, df)
         return df
 
+    @staticmethod
+    def _get_available_report_date(ref_date: str) -> pd.Timestamp:
+        """
+        根据 ref_date 和 FINANCIAL_LAG_MONTHS 计算最新可用财报日期.
+
+        财报披露规则:
+          一季报(3/31) → 4/30前公布,5月起可用
+          中报(6/30) → 8/31前公布,9月起可用
+          三季报(9/30) → 10/31前公布,11月起可用
+          年报(12/31) → 次年4/30前公布,次年5月起可用
+        """
+        ref = pd.Timestamp(ref_date)
+        ref_year = ref.year
+
+        # 候选报告期:从近到远
+        candidates = []
+        for year_offset in [0, -1, -2]:
+            y = ref_year + year_offset
+            for q_month, available_month in FINANCIAL_LAG_MONTHS.items():
+                # 报告期日期(季末)
+                report_date = pd.Timestamp(year=y, month=q_month, day=1) + pd.offsets.MonthEnd(0)
+                # 可用日期
+                if q_month == 12:
+                    # 年报:次年X月可用
+                    available_date = pd.Timestamp(year=y + 1, month=available_month, day=1)
+                else:
+                    available_date = pd.Timestamp(year=y, month=available_month, day=1)
+                if ref >= available_date:
+                    candidates.append(report_date)
+
+        return max(candidates) if candidates else pd.Timestamp(year=ref_year - 3, month=12, day=31)
+
     @retry_on_error(max_retries=2, delay=0.5)
-    def _fetch_single_financial(self, symbol: str) -> Optional[dict]:
-        """获取单只股票核心财务指标(最新一期)"""
+    def _fetch_single_financial(self, symbol: str, ref_date: str = "") -> Optional[dict]:
+        """
+        获取单只股票核心财务指标.
+
+        防前视偏差: 只取 ref_date 之前已披露的最近一期财报.
+        """
         import akshare as ak
         code = symbol.replace(".XSHG", "").replace(".XSHE", "")
 
@@ -393,6 +622,25 @@ class AgentData:
             df = ak.stock_financial_analysis_indicator(symbol=code, start_year="2020")
             if df is None or df.empty:
                 return None
+
+            # 防前视偏差: 只取 ref_date 前可用的财报
+            if ref_date:
+                available_date = self._get_available_report_date(ref_date)
+
+                # 找日期列(akshare 通常用"日期"列)
+                date_col = None
+                for c in df.columns:
+                    if "日期" in str(c) or "date" in str(c).lower():
+                        date_col = c
+                        break
+
+                if date_col is not None:
+                    df["_report_date"] = pd.to_datetime(df[date_col], errors="coerce")
+                    df = df[df["_report_date"] <= available_date].drop(columns=["_report_date"])
+                    if df.empty:
+                        logger.debug("%s: 无 %s 之前的财报数据", symbol, available_date.date())
+                        return None
+                # 若找不到日期列,退回取 iloc[0](降级处理)
 
             latest = df.iloc[0]
             result = {}
@@ -539,27 +787,32 @@ class AgentData:
     # ============================================================
 
     def get_macro_data(self, ref_date: Optional[str] = None) -> dict:
-        """获取宏观指标:PMI,M2增速,社融增速."""
-        cached = load_cache(CACHE_MACRO) if self.use_cache else None
+        """
+        获取宏观指标:PMI,M2增速,社融增速.
+
+        防前视偏差: 根据 ref_date 截断历史序列,只取该日期之前的数据.
+        """
+        cache_name = f"{CACHE_MACRO}_{ref_date}" if ref_date else CACHE_MACRO
+        cached = load_cache(cache_name) if self.use_cache else None
         if cached is not None:
             return cached
 
-        logger.info("获取宏观数据...")
+        logger.info("获取宏观数据 (ref=%s)...", ref_date or "latest")
         result = {}
 
-        pmi = self._fetch_pmi()
+        pmi = self._fetch_pmi(ref_date)
         if pmi is not None and not pmi.empty:
             result["pmi"] = float(pmi.iloc[-1])
             pmi_series = pmi.astype(float)
             result["pmi_pct"] = round((pmi_series < result["pmi"]).mean() * 100, 2)
 
-        m2 = self._fetch_m2()
+        m2 = self._fetch_m2(ref_date)
         if m2 is not None and not m2.empty:
             result["m2_yoy"] = float(m2.iloc[-1])
             m2_series = m2.astype(float)
             result["m2_yoy_pct"] = round((m2_series < result["m2_yoy"]).mean() * 100, 2)
 
-        sf = self._fetch_social_financing()
+        sf = self._fetch_social_financing(ref_date)
         if sf is not None and not sf.empty:
             result["social_fin_yoy"] = float(sf.iloc[-1])
             sf_series = sf.astype(float)
@@ -567,13 +820,38 @@ class AgentData:
                 (sf_series < result["social_fin_yoy"]).mean() * 100, 2
             )
 
-        save_cache(CACHE_MACRO, result)
+        save_cache(cache_name, result)
         return result
 
+    @staticmethod
+    def _truncate_by_date(df: pd.DataFrame, ref_date: str) -> pd.DataFrame:
+        """根据 ref_date 截断 DataFrame,只保留该日期之前的行"""
+        if not ref_date or df is None or df.empty:
+            return df
+
+        ref_ts = pd.Timestamp(ref_date)
+        # 找日期列
+        date_col = None
+        for c in df.columns:
+            if "月" in str(c) or "日期" in str(c) or "date" in str(c).lower():
+                date_col = c
+                break
+
+        if date_col is not None:
+            dates = pd.to_datetime(df[date_col], errors="coerce")
+            df = df[dates <= ref_ts]
+            if df.empty:
+                logger.warning("宏观数据: 截断后为空 (ref=%s)", ref_date)
+
+        return df
+
     @retry_on_error(max_retries=2, delay=0.5)
-    def _fetch_pmi(self) -> Optional[pd.Series]:
+    def _fetch_pmi(self, ref_date: Optional[str] = None) -> Optional[pd.Series]:
         import akshare as ak
         df = ak.macro_china_pmi()
+        if df is None or df.empty:
+            return None
+        df = self._truncate_by_date(df, ref_date)
         if df is None or df.empty:
             return None
         for c in ["制造业PMI", "PMI", "数值"]:
@@ -582,9 +860,12 @@ class AgentData:
         return None
 
     @retry_on_error(max_retries=2, delay=0.5)
-    def _fetch_m2(self) -> Optional[pd.Series]:
+    def _fetch_m2(self, ref_date: Optional[str] = None) -> Optional[pd.Series]:
         import akshare as ak
         df = ak.macro_china_money_supply()
+        if df is None or df.empty:
+            return None
+        df = self._truncate_by_date(df, ref_date)
         if df is None or df.empty:
             return None
         for c in ["M2同比", "M2同比增长", "M2供应量同比增长"]:
@@ -597,12 +878,15 @@ class AgentData:
         return None
 
     @retry_on_error(max_retries=2, delay=0.5)
-    def _fetch_social_financing(self) -> Optional[pd.Series]:
+    def _fetch_social_financing(self, ref_date: Optional[str] = None) -> Optional[pd.Series]:
         import akshare as ak
         try:
             df = ak.macro_china_shrzgm()
         except Exception:
             return None
+        if df is None or df.empty:
+            return None
+        df = self._truncate_by_date(df, ref_date)
         if df is None or df.empty:
             return None
         for c in ["社会融资规模增量", "社融增量"]:

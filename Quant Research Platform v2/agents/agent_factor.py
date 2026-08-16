@@ -25,7 +25,7 @@ from config import (
     MOMENTUM_1M, MOMENTUM_3M,
     VOLATILITY_20D, REVERSAL_5D,
 )
-from utils import (
+from config.utils import (
     get_logger, safe_percentile_rank, winsorize, weighted_score,
 )
 

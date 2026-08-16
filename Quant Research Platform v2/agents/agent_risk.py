@@ -21,7 +21,7 @@ from config import (
     RISK_STOCK_PE_PCT, RISK_STOCK_PB_PCT, RISK_PEG_THRESHOLD,
     RISK_PENALTY_PER_TRIGGER, RISK_PENALTY_MAX,
 )
-from utils import get_logger, safe_percentile_rank
+from config.utils import get_logger, safe_percentile_rank
 
 logger = get_logger("AgentRisk")
 

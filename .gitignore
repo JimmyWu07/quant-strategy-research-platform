@@ -30,9 +30,11 @@ Quant Research Platform v2/data_cache/
 # OS
 .DS_Store
 Thumbs.db
+
 # Microsoft Office temporary files
 ~$*
 *.tmp
 
-# Local Word docs (not for public repo)
+# Local docs & AI memory files
+CLAUDE.md
 v2模块拆解分析.docx

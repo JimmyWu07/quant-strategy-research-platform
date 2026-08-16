@@ -691,7 +691,7 @@ class AgentData:
 
     def get_industry_map(self) -> Dict[str, str]:
         """
-        获取股票 → 行业映射(同花顺行业分类,近似申万二级粒度).
+        获取股票 → 行业映射(新浪行业分类).
         """
         if self._industry_map is not None:
             return self._industry_map
@@ -714,29 +714,35 @@ class AgentData:
 
     @retry_on_error(max_retries=2, delay=0.5)
     def _fetch_industry_from_ths(self) -> Dict[str, str]:
-        """通过同花顺行业板块获取股票-行业映射"""
+        """通过新浪行业板块获取股票-行业映射
+
+        akshare 1.18.59 移除了 stock_board_industry_cons_ths(),
+        改用 stock_sector_spot + stock_sector_detail (新浪源).
+        """
         import akshare as ak
 
-        # 获取所有行业板块
-        boards = ak.stock_board_industry_name_ths()
+        boards = ak.stock_sector_spot(indicator="新浪行业")
         if boards is None or boards.empty:
-            logger.warning("同花顺行业板块列表为空")
+            logger.warning("新浪行业板块列表为空")
             return {}
 
         industry_map = {}
         total_boards = len(boards)
 
         for idx, (_, row) in enumerate(boards.iterrows()):
-            board_name = row.get("name", "")
-            board_code = row.get("code", "")
-            if not board_code or not board_name:
+            label = str(row.get("label", ""))
+            board_name = str(row.get("板块", ""))
+            if not label or not board_name:
                 continue
 
+            if (idx + 1) % 10 == 0:
+                logger.info(progress_bar(idx + 1, total_boards, "行业分类"))
+
             try:
-                cons = ak.stock_board_industry_cons_ths(symbol=board_code)
+                cons = ak.stock_sector_detail(sector=label)
                 if cons is None or cons.empty:
                     continue
-                code_col = "代码" if "代码" in cons.columns else cons.columns[0]
+                code_col = "code" if "code" in cons.columns else cons.columns[0]
                 for _, sr in cons.iterrows():
                     sym = clean_symbol(str(sr[code_col]))
                     industry_map[sym] = board_name
@@ -825,12 +831,16 @@ class AgentData:
 
     @staticmethod
     def _truncate_by_date(df: pd.DataFrame, ref_date: str) -> pd.DataFrame:
-        """根据 ref_date 截断 DataFrame,只保留该日期之前的行"""
+        """根据 ref_date 截断 DataFrame,只保留该日期之前的行
+
+        akshare 宏观数据日期格式:
+          - PMI/M2: "2026年07月份" (中文格式)
+          - 社融: "202604" (YYYYMM 数字格式)
+        """
         if not ref_date or df is None or df.empty:
             return df
 
         ref_ts = pd.Timestamp(ref_date)
-        # 找日期列
         date_col = None
         for c in df.columns:
             if "月" in str(c) or "日期" in str(c) or "date" in str(c).lower():
@@ -838,8 +848,25 @@ class AgentData:
                 break
 
         if date_col is not None:
-            dates = pd.to_datetime(df[date_col], errors="coerce")
-            df = df[dates <= ref_ts]
+            parsed_dates = []
+            for val in df[date_col]:
+                val_str = str(val).strip()
+                ts = None
+                m = re.match(r"(\d{4})年(\d{1,2})月份?", val_str)
+                if m:
+                    ts = pd.Timestamp(year=int(m.group(1)), month=int(m.group(2)), day=1)
+                else:
+                    m2 = re.match(r"(\d{4})(\d{2})$", val_str)
+                    if m2:
+                        ts = pd.Timestamp(year=int(m2.group(1)), month=int(m2.group(2)), day=1)
+                if ts is None:
+                    ts = pd.to_datetime(val_str, errors="coerce")
+                parsed_dates.append(ts)
+
+            df = df.copy()
+            df["_parsed_date"] = parsed_dates
+            df = df[df["_parsed_date"] <= ref_ts]
+            df = df.sort_values("_parsed_date", ascending=True).drop(columns=["_parsed_date"])
             if df.empty:
                 logger.warning("宏观数据: 截断后为空 (ref=%s)", ref_date)
 
@@ -854,7 +881,7 @@ class AgentData:
         df = self._truncate_by_date(df, ref_date)
         if df is None or df.empty:
             return None
-        for c in ["制造业PMI", "PMI", "数值"]:
+        for c in ["制造业-指数", "制造业PMI", "PMI", "数值"]:
             if c in df.columns:
                 return pd.to_numeric(df[c], errors="coerce").dropna()
         return None
@@ -868,7 +895,7 @@ class AgentData:
         df = self._truncate_by_date(df, ref_date)
         if df is None or df.empty:
             return None
-        for c in ["M2同比", "M2同比增长", "M2供应量同比增长"]:
+        for c in ["货币和准货币(M2)-同比增长", "M2同比", "M2同比增长", "M2供应量同比增长"]:
             if c in df.columns:
                 return pd.to_numeric(df[c], errors="coerce").dropna()
         if "M2" in df.columns or "货币和准货币(M2)" in df.columns:

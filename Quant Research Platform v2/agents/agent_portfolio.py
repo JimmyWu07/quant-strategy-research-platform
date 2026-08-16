@@ -303,7 +303,8 @@ class AgentPortfolio:
             for sym, row in top10.iterrows():
                 ind = row.get("industry", "?")
                 score = row.get("final_score", 0)
-                lines.append(f"    {sym} | {ind:12s} | 得分: {score:.1f}")
+                ind_str = str(ind) if ind and not (isinstance(ind, float) and pd.isna(ind)) else "?"
+                lines.append(f"    {sym} | {ind_str:12s} | 得分: {score:.1f}")
 
         lines.append("=" * 60)
         return "\n".join(lines)
